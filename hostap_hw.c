@@ -152,6 +152,7 @@ static int prism2_get_ram_size(local_info_t *local);
 #endif
 
 
+#ifndef PRISM2_USB
 static u16 hfa384x_read_reg(struct net_device *dev, u16 reg)
 {
 	return HFA384X_INW(reg);
@@ -167,6 +168,7 @@ static void hfa384x_read_regs(struct net_device *dev,
 	regs->offset1 = HFA384X_INW(HFA384X_OFFSET1_OFF);
 	regs->swsupport0 = HFA384X_INW(HFA384X_SWSUPPORT0_OFF);
 }
+#endif
 
 
 /**
@@ -246,6 +248,7 @@ static void prism2_clear_cmd_queue(local_info_t *local)
 }
 
 
+#ifndef PRISM2_USB
 /**
  * hfa384x_cmd_issue - Issue a Prism2 command to the hardware
  * @dev: pointer to net_device
@@ -304,6 +307,7 @@ static int hfa384x_cmd_issue(struct net_device *dev,
 
 	return 0;
 }
+#endif
 
 
 /**
@@ -444,6 +448,7 @@ static int hfa384x_cmd(struct net_device *dev, u16 cmd, u16 param0,
 	}
 
 	if (entry->type != CMD_COMPLETED) {
+#ifndef PRISM2_USB
 		u16 reg = HFA384X_INW(HFA384X_EVSTAT_OFF);
 		printk(KERN_DEBUG "%s: hfa384x_cmd: command was not "
 		       "completed (res=%d, entry=%p, type=%d, cmd=0x%04x, "
@@ -457,6 +462,12 @@ static int hfa384x_cmd(struct net_device *dev, u16 cmd, u16 param0,
 			printk(KERN_WARNING "%s: interrupt delivery does not "
 			       "seem to work\n", dev->name);
 		}
+#else
+		printk(KERN_DEBUG "%s: hfa384x_cmd: command was not "
+		       "completed (res=%d, entry=%p, type=%d, cmd=0x%04x, "
+		       "param0=0x%04x)\n", dev->name,
+		       res, entry, entry->type, entry->cmd, entry->param0);
+#endif
 		prism2_io_debug_error(dev, 3);
 		res = -ETIMEDOUT;
 		goto done;
@@ -546,6 +557,7 @@ static int hfa384x_cmd_callback(struct net_device *dev, u16 cmd, u16 param0,
 }
 
 
+#ifndef PRISM2_USB
 /**
  * __hfa384x_cmd_no_wait - Issue a Prism2 command (private)
  * @dev: pointer to net_device
@@ -999,6 +1011,7 @@ static u16 hfa384x_allocate_fid(struct net_device *dev, int len)
 
 	return fid;
 }
+#endif
 
 
 static int prism2_reset_port(struct net_device *dev)
@@ -1292,6 +1305,7 @@ static int prism2_setup_rids(struct net_device *dev)
 }
 
 
+#ifndef PRISM2_USB
 static int prism2_hw_init(struct net_device *dev, int initial)
 {
 	struct hostap_interface *iface;
@@ -1346,13 +1360,53 @@ static int prism2_hw_init(struct net_device *dev, int initial)
 	HFA384X_OUTW(HFA384X_EV_CMD, HFA384X_EVACK_OFF);
 	return 0;
 }
+#endif
 
+
+#ifndef PRISM2_USB
+static int prism2_alloc_txfid(struct net_device *dev)
+{
+	int i;
+	struct hostap_interface *iface;
+	local_info_t *local;
+
+	iface = netdev_priv(dev);
+	local = iface->local;
+
+	/* FIX: could convert allocate_fid to use sleeping CmdCompl wait and
+	 * enable interrupts before this. This would also require some sort of
+	 * sleeping AllocEv waiting */
+
+	/* allocate TX FIDs */
+	local->txfid_len = PRISM2_TXFID_LEN;
+	for (i = 0; i < PRISM2_TXFID_COUNT; i++) {
+		local->txfid[i] = hfa384x_allocate_fid(dev, local->txfid_len);
+		if (local->txfid[i] == 0xffff && local->txfid_len > 1600) {
+			local->txfid[i] = hfa384x_allocate_fid(dev, 1600);
+			if (local->txfid[i] != 0xffff) {
+				printk(KERN_DEBUG "%s: Using shorter TX FID "
+				       "(1600 bytes)\n", dev->name);
+				local->txfid_len = 1600;
+			}
+		}
+		if (local->txfid[i] == 0xffff)
+			return -1;
+		local->intransmitfid[i] = PRISM2_TXFID_EMPTY;
+	}
+
+	return 0;
+}
+#else
+static int prism2_alloc_txfid(struct net_device *dev)
+{
+	return 0;
+}
+#endif
 
 static int prism2_hw_init2(struct net_device *dev, int initial)
 {
 	struct hostap_interface *iface;
 	local_info_t *local;
-	int i;
 
 	iface = netdev_priv(dev);
 	local = iface->local;
@@ -1368,12 +1422,14 @@ static int prism2_hw_init2(struct net_device *dev, int initial)
 	hfa384x_disable_interrupts(dev);
 
 #ifndef final_version
+#ifndef PRISM2_USB
 	HFA384X_OUTW(HFA384X_MAGIC, HFA384X_SWSUPPORT0_OFF);
 	if (HFA384X_INW(HFA384X_SWSUPPORT0_OFF) != HFA384X_MAGIC) {
 		printk("SWSUPPORT0 write/read failed: %04X != %04X\n",
 		       HFA384X_INW(HFA384X_SWSUPPORT0_OFF), HFA384X_MAGIC);
 		goto failed;
 	}
+#endif
 #endif
 
 	if (initial || local->pri_only) {
@@ -1395,26 +1451,8 @@ static int prism2_hw_init2(struct net_device *dev, int initial)
 		hfa384x_disable_interrupts(dev);
 	}
 
-	/* FIX: could convert allocate_fid to use sleeping CmdCompl wait and
-	 * enable interrupts before this. This would also require some sort of
-	 * sleeping AllocEv waiting */
-
-	/* allocate TX FIDs */
-	local->txfid_len = PRISM2_TXFID_LEN;
-	for (i = 0; i < PRISM2_TXFID_COUNT; i++) {
-		local->txfid[i] = hfa384x_allocate_fid(dev, local->txfid_len);
-		if (local->txfid[i] == 0xffff && local->txfid_len > 1600) {
-			local->txfid[i] = hfa384x_allocate_fid(dev, 1600);
-			if (local->txfid[i] != 0xffff) {
-				printk(KERN_DEBUG "%s: Using shorter TX FID "
-				       "(1600 bytes)\n", dev->name);
-				local->txfid_len = 1600;
-			}
-		}
-		if (local->txfid[i] == 0xffff)
-			goto failed;
-		local->intransmitfid[i] = PRISM2_TXFID_EMPTY;
-	}
+	if (prism2_alloc_txfid(dev))
+		goto failed;
 
 	hfa384x_events_only_cmd(dev);
 
@@ -1661,6 +1699,7 @@ static void handle_reset_queue(struct work_struct *work)
 }
 
 
+#ifndef PRISM2_USB
 static int prism2_get_txfid_idx(local_info_t *local)
 {
 	int idx, end;
@@ -1891,6 +1930,7 @@ fail:
 	prism2_callback(local, PRISM2_CALLBACK_TX_END);
 	return ret;
 }
+#endif
 
 
 /* Some SMP systems have reported number of odd errors with hostap_pci. fid
@@ -1900,6 +1940,7 @@ fail:
  * and will try to get the correct fid eventually. */
 #define EXTRA_FID_READ_TESTS
 
+#ifndef PRISM2_USB
 static u16 prism2_read_fid_reg(struct net_device *dev, u16 reg)
 {
 #ifdef EXTRA_FID_READ_TESTS
@@ -2032,6 +2073,7 @@ static void prism2_rx(local_info_t *local)
 		dev_kfree_skb(skb);
 	goto rx_exit;
 }
+#endif
 
 
 /* Called only as a tasklet (software IRQ) */
@@ -2103,6 +2145,7 @@ static void hostap_rx_tasklet(unsigned long data)
 }
 
 
+#ifndef PRISM2_USB
 /* Called only from hardware IRQ */
 static void prism2_alloc_ev(struct net_device *dev)
 {
@@ -2295,6 +2338,7 @@ static void prism2_tx_ev(local_info_t *local)
  fail:
 	HFA384X_OUTW(HFA384X_EV_TX, HFA384X_EVACK_OFF);
 }
+#endif
 
 
 /* Called only as a tasklet (software IRQ) */
@@ -2321,6 +2365,7 @@ static void hostap_sta_tx_exc_tasklet(unsigned long data)
 }
 
 
+#ifndef PRISM2_USB
 /* Called only as a tasklet (software IRQ) */
 static void prism2_txexc(local_info_t *local)
 {
@@ -2398,6 +2443,7 @@ static void prism2_txexc(local_info_t *local)
 	       txdesc.addr1, txdesc.addr2,
 	       txdesc.addr3, txdesc.addr4);
 }
+#endif
 
 
 /* Called only as a tasklet (software IRQ) */
@@ -2413,6 +2459,7 @@ static void hostap_info_tasklet(unsigned long data)
 }
 
 
+#ifndef PRISM2_USB
 /* Called only as a tasklet (software IRQ) */
 static void prism2_info(local_info_t *local)
 {
@@ -2735,6 +2782,7 @@ static irqreturn_t prism2_interrupt(int irq, void *dev_id)
 	prism2_io_debug_add(dev, PRISM2_IO_DEBUG_CMD_INTERRUPT, 0, 1);
 	return IRQ_RETVAL(events);
 }
+#endif
 
 
 static void prism2_check_sta_fw_version(local_info_t *local)
@@ -2897,6 +2945,7 @@ static void hostap_tick_timer(unsigned long data)
 }
 
 
+#ifndef PRISM2_USB
 #ifndef PRISM2_NO_PROCFS_DEBUG
 static int prism2_registers_proc_read(char *page, char **start, off_t off,
 				      int count, int *eof, void *data)
@@ -2959,6 +3008,7 @@ p += sprintf(p, #n "=%04x\n", hfa384x_read_reg(local->dev, HFA384X_##n##_OFF))
 	return (p - page);
 }
 #endif /* PRISM2_NO_PROCFS_DEBUG */
+#endif
 
 
 struct set_tim_data {
@@ -3201,8 +3251,10 @@ prism2_init_local_data(struct prism2_helper_functions *funcs, int card_idx,
 #define HOSTAP_TASKLET_INIT(q, f, d) \
 do { memset((q), 0, sizeof(*(q))); (q)->func = (f); (q)->data = (d); } \
 while (0)
+#ifndef PRISM2_USB
 	HOSTAP_TASKLET_INIT(&local->bap_tasklet, hostap_bap_tasklet,
 			    (unsigned long) local);
+#endif
 
 	HOSTAP_TASKLET_INIT(&local->info_tasklet, hostap_info_tasklet,
 			    (unsigned long) local);
@@ -3279,10 +3331,12 @@ static int hostap_hw_ready(struct net_device *dev)
 			netif_carrier_off(local->ddev);
 		}
 		hostap_init_proc(local);
+#ifndef PRISM2_USB
 #ifndef PRISM2_NO_PROCFS_DEBUG
 		create_proc_read_entry("registers", 0, local->proc,
 				       prism2_registers_proc_read, local);
 #endif /* PRISM2_NO_PROCFS_DEBUG */
+#endif
 		hostap_init_ap_proc(local);
 		return 0;
 	}
@@ -3381,7 +3435,7 @@ static void prism2_free_local_data(struct net_device *dev)
 }
 
 
-#if (defined(PRISM2_PCI) && defined(CONFIG_PM)) || defined(PRISM2_PCCARD)
+#if (defined(PRISM2_PCI) && defined(CONFIG_PM)) || defined(PRISM2_PCCARD) || defined(PRISM2_USB)
 static void prism2_suspend(struct net_device *dev)
 {
 	struct hostap_interface *iface;
