@@ -189,7 +189,7 @@ static int prism2_usb_probe(struct usb_interface *interface,
 	usb = interface_to_usbdev(interface);
 
 	dev = prism2_init_local_data(&prism2_usb_funcs, cards_found,
-				     &dev->dev);
+				     &interface->dev);
 	if (dev == NULL)
 		goto fail;
 	iface = netdev_priv(dev);
