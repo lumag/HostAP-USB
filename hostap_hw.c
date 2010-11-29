@@ -2945,8 +2945,8 @@ static void hostap_tick_timer(unsigned long data)
 }
 
 
-#ifndef PRISM2_USB
 #ifndef PRISM2_NO_PROCFS_DEBUG
+#ifndef PRISM2_USB
 static int prism2_registers_proc_read(char *page, char **start, off_t off,
 				      int count, int *eof, void *data)
 {
@@ -3007,8 +3007,18 @@ p += sprintf(p, #n "=%04x\n", hfa384x_read_reg(local->dev, HFA384X_##n##_OFF))
 
 	return (p - page);
 }
-#endif /* PRISM2_NO_PROCFS_DEBUG */
+#else
+static int prism2_registers_proc_read(char *page, char **start, off_t off,
+				      int count, int *eof, void *data)
+{
+	char *p = page;
+
+	p += sprintf(p, "Register-level debug is not suported for USB devices!\n");
+
+	return (p - page);
+}
 #endif
+#endif /* PRISM2_NO_PROCFS_DEBUG */
 
 
 struct set_tim_data {
@@ -3331,12 +3341,10 @@ static int hostap_hw_ready(struct net_device *dev)
 			netif_carrier_off(local->ddev);
 		}
 		hostap_init_proc(local);
-#ifndef PRISM2_USB
 #ifndef PRISM2_NO_PROCFS_DEBUG
 		create_proc_read_entry("registers", 0, local->proc,
 				       prism2_registers_proc_read, local);
 #endif /* PRISM2_NO_PROCFS_DEBUG */
-#endif
 		hostap_init_ap_proc(local);
 		return 0;
 	}
