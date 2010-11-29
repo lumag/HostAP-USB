@@ -11,7 +11,7 @@
 #include "hostap_wlan.h"
 
 
-static char *dev_info = "hostap_pci";
+static char *dev_info = "hostap_usb";
 
 MODULE_AUTHOR("Dmitry Eremin-Solenikov");
 MODULE_DESCRIPTION("Support for Intersil Prism2.5-based 802.11 wireless LAN "
