@@ -545,9 +545,31 @@ static int prism2_hw_init(struct net_device *dev, int initial)
 #endif /* PRISM2_DOWNLOAD_SUPPORT */
 		return 1;
 	}
-	msleep(100);
+	msleep(500);
 	local->no_pri = 0;
 	return 0;
+}
+
+static void prism2_info(local_info_t *local, struct sk_buff *skb)
+{
+	struct net_device *dev = local->dev;
+	u16 len, type;
+
+	len = le16_to_cpu(*(u16*)(skb->data));
+	type = le16_to_cpu(*(u16*)(skb->data + 2));
+
+	if ((len & 0x8000) || len == 0 ||  len > 1031) {
+		/* data register seems to give 0x8000 in some error cases even
+		 * though busy bit is not set in offset register;
+		 * in addition, length must be at least 1 due to type field */
+		printk(KERN_DEBUG "%s: Received info frame with invalid "
+		       "length 0x%04x (type 0x%04x)\n", dev->name,
+		       len, type);
+		dev_kfree_skb(skb);
+	} else {
+		skb_queue_tail(&local->info_list, skb);
+		tasklet_schedule(&local->info_tasklet);
+	}
 }
 
 /* FIX: This might change at some point.. */
@@ -594,6 +616,9 @@ static void hfa384x_usbin_callback(struct urb *urb)
 	if (type & 0x8000) {
 		skb_pull(skb, 2);
 		switch (type &~0x8000) {
+		case HFA384x_USB_TYPE_INFO:
+			prism2_info(local, skb);
+			break;
 		case HFA384x_USB_TYPE_CMD:
 			prism2_cmd_ev(dev, skb);
 			dev_kfree_skb(skb);
@@ -634,7 +659,7 @@ static void prism2_usb_cor_sreset(local_info_t *local)
 	struct hostap_usb_priv *hw_priv = local->hw_priv;
 
 	printk(KERN_INFO "%s: resetting device %p\n", dev_info, hw_priv->usb);
-//	usb_reset_device(hw_priv->usb);
+	usb_reset_device(hw_priv->usb);
 }
 
 static struct prism2_helper_functions prism2_usb_funcs =
