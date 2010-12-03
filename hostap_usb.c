@@ -22,7 +22,23 @@ MODULE_LICENSE("GPL");
 /* struct local_info::hw_priv */
 struct hostap_usb_priv {
 	struct usb_device *usb;
+	int endp_in;
+	int endp_out;
+	struct urb rx_urb;
+	struct urb tx_urb;
+	struct sk_buff *rx_skb;
+	struct sk_buff_head tx_queue;
 };
+
+struct hostap_usb_skb_cb {
+	struct completion comp;
+	struct sk_buff *response;
+};
+
+static inline struct hostap_usb_skb_cb *hfa384x_cb(struct sk_buff *skb)
+{
+	return (struct hostap_usb_skb_cb *)skb->cb;
+}
 
 #define PRISM_USB_DEVICE(vid, pid, name)	\
 	USB_DEVICE(vid, pid),			\
@@ -100,6 +116,9 @@ static struct usb_device_id prism2_usb_id_table[] = {
 
 MODULE_DEVICE_TABLE(usb, prism2_usb_id_table);
 
+/* forward declarations from hostap_hw.c */
+static void prism2_hw_reset(struct net_device *dev);
+
 /* ignore interrupts for USB */
 static void hfa384x_enable_interrupts(struct net_device *dev) {}
 static void hfa384x_disable_interrupts(struct net_device *dev) {}
@@ -116,14 +135,376 @@ static void hfa384x_read_regs(struct net_device *dev,
 	regs->swsupport0 = 0xdead;
 }
 
-/* FIXME */
+struct hfa384x_usbin {
+	u16 type;
+	union {
+		u16 boguspad[1207];
+	};
+} __packed;
+
+enum {
+	HFA384x_USB_TYPE_INFO,
+	HFA384x_USB_TYPE_CMD,
+	HFA384x_USB_TYPE_WRRID,
+	HFA384x_USB_TYPE_RDRID,
+	HFA384x_USB_TYPE_WRMEM,
+	HFA384x_USB_TYPE_RDMEM,
+};
+
+#define ROUNDUP64(s)		(((s) + 63) & ~63)
+#define ALLOC_TX_SKB(size)	dev_alloc_skb(ROUNDUP64(size))
+
+struct hfa384x_cmd_req {
+	__le16 type;
+	__le16 cmd;
+	__le16 param0;
+	__le16 param1;
+	__le16 param2;
+} __packed;
+
+struct hfa384x_rrid_req {
+	__le16 type;
+	__le16 frmlen;
+	__le16 rid;
+} __packed;
+
+
+struct hfa384x_wrid_req {
+	__le16 type;
+	__le16 frmlen;
+	__le16 rid;
+/*	u8 data[xxx]; */
+} __packed;
+
+
+static void hfa384x_usbout_callback(struct urb *urb)
+{
+	struct net_device *dev = urb->context;
+	struct hostap_interface *iface = netdev_priv(dev);
+	local_info_t *local = iface->local;
+	struct hostap_usb_priv *hw_priv = local->hw_priv;
+	struct sk_buff *skb;
+
+	printk(KERN_DEBUG "hostap_usb urbout received!\n");
+	switch (urb->status) {
+	case 0:
+		break;
+	case -EPIPE:
+		printk(KERN_ERR "tx pipe stall\n");
+		break;
+	default:
+		printk(KERN_ERR "tx %d\n", urb->status);
+		break;
+	}
+
+	// FIXME
+	if (urb->status != 0) {
+		skb = skb_dequeue(&hw_priv->tx_queue);
+		complete_all(&hfa384x_cb(skb)->comp);
+		return;
+	}
+
+	printk(KERN_DEBUG "type %04x\n", *(u16*)(urb->transfer_buffer));
+}
+
+static void hfa384x_usbin_callback(struct urb *urb);
+
+static int hfa384x_submit_rx_urb(struct net_device *dev, gfp_t flags)
+{
+	struct hostap_interface *iface = netdev_priv(dev);
+	local_info_t *local = iface->local;
+	struct hostap_usb_priv *hw_priv = local->hw_priv;
+	struct sk_buff *skb;
+	int ret;
+
+	skb = dev_alloc_skb(sizeof(struct hfa384x_usbin));
+	if (!skb)
+		return -ENOMEM;
+
+	usb_fill_bulk_urb(&hw_priv->rx_urb, hw_priv->usb,
+			hw_priv->endp_in, skb->data, sizeof(struct hfa384x_usbin),
+			hfa384x_usbin_callback, dev);
+
+	hw_priv->rx_skb = skb;
+
+	/* FIXME: don't resubmit while we are at stall ??? */
+	ret = usb_submit_urb(&hw_priv->rx_urb, flags);
+	if (ret == -EPIPE) {
+		printk(KERN_ERR "%s rx pipe stall!\n", dev->name);
+		// FIXME;
+	}
+
+	if (ret != 0) {
+		printk(KERN_ERR "%s rx submit %d\n", dev->name, ret);
+		hw_priv->rx_skb = NULL;
+		dev_kfree_skb(skb);
+	}
+
+	return ret;
+}
+
+static int hfa384x_submit_tx_urb(struct net_device *dev, gfp_t flags)
+{
+	struct hostap_interface *iface = netdev_priv(dev);
+	local_info_t *local = iface->local;
+	struct hostap_usb_priv *hw_priv = local->hw_priv;
+	struct sk_buff *skb;
+	int ret;
+
+	skb = skb_peek(&hw_priv->tx_queue);
+	BUG_ON(!skb);
+
+	usb_fill_bulk_urb(&hw_priv->tx_urb, hw_priv->usb,
+			hw_priv->endp_out, skb->data, ROUNDUP64(skb->len),
+			hfa384x_usbout_callback, dev);
+
+	print_hex_dump_bytes("out ", DUMP_PREFIX_OFFSET, skb->data, skb->len);
+
+	/* FIXME: don't resubmit while we are at stall ??? */
+	ret = usb_submit_urb(&hw_priv->tx_urb, flags);
+	if (ret == -EPIPE) {
+		printk(KERN_ERR "%s tx pipe stall!\n", dev->name);
+		// FIXME;
+	}
+	if (ret)
+		printk(KERN_ERR "%s tx submit %d\n", dev->name, ret);
+
+	return ret;
+}
+
+static int hfa384x_usbout(struct net_device *dev, struct sk_buff *skb)
+{
+	struct hostap_interface *iface = netdev_priv(dev);
+	local_info_t *local = iface->local;
+	struct hostap_usb_priv *hw_priv = local->hw_priv;
+	unsigned long flags;
+	int start_tx = 0;
+
+	spin_lock_irqsave(&hw_priv->tx_queue.lock, flags);
+	if (skb) {
+		init_completion(&hfa384x_cb(skb)->comp);
+		hfa384x_cb(skb)->response = NULL;
+		__skb_queue_tail(&hw_priv->tx_queue, skb);
+	}
+	printk(KERN_DEBUG "usbout: %p\n", skb);
+	if (skb_queue_len(&hw_priv->tx_queue) == 1)
+		 start_tx = 1;
+	spin_unlock_irqrestore(&hw_priv->tx_queue.lock, flags);
+
+	if (start_tx)
+		return hfa384x_submit_tx_urb(dev, GFP_ATOMIC);
+
+	return 0;
+}
+
+static int hfa384x_wait(struct net_device *dev, struct sk_buff *skb)
+{
+	struct hostap_interface *iface = netdev_priv(dev);
+	local_info_t *local = iface->local;
+	struct hostap_usb_priv *hw_priv = local->hw_priv;
+	int res;
+	unsigned long flags;
+
+	res = wait_for_completion_interruptible_timeout(&hfa384x_cb(skb)->comp, 5 * HZ);
+	if (res > 0)
+		return 0;
+
+	if (res == 0) {
+		res = -ETIMEDOUT;
+	}
+
+	usb_kill_urb(&hw_priv->tx_urb);
+	// FIXME: rethink
+	spin_lock_irqsave(&hw_priv->tx_queue.lock, flags);
+	if (skb->next)
+		skb_unlink(skb, &hw_priv->tx_queue);
+	spin_unlock_irqrestore(&hw_priv->tx_queue.lock, flags);
+	return res;
+}
+
 static int hfa384x_get_rid(struct net_device *dev, u16 rid, void *buf, int len,
-			   int exact_len) {return -ENOTTY;}
-static int hfa384x_set_rid(struct net_device *dev, u16 rid, void *buf, int len) {return -ENOTTY;}
+			   int exact_len) {
+	struct hostap_interface *iface;
+	local_info_t *local;
+	int res, rlen = 0;
+	struct sk_buff *skb, *respskb;
+	struct hfa384x_rrid_req ridrq;
+
+	iface = netdev_priv(dev);
+	local = iface->local;
+
+	if (local->no_pri) {
+		printk(KERN_DEBUG "%s: cannot get RID %04x (len=%d) - no PRI "
+		       "f/w\n", dev->name, rid, len);
+		return -ENOTTY; /* Well.. not really correct, but return
+				 * something unique enough.. */
+	}
+
+	if ((local->func->card_present && !local->func->card_present(local)) ||
+	    local->hw_downloading)
+		return -ENODEV;
+
+	skb = ALLOC_TX_SKB(sizeof(ridrq));
+	if (!skb)
+		return -ENOMEM;
+
+	memset(&ridrq, 0, sizeof(ridrq));
+	ridrq.type = cpu_to_le16(HFA384x_USB_TYPE_RDRID);
+	ridrq.frmlen = cpu_to_le16(2);
+	ridrq.rid = cpu_to_le16(rid);
+
+	memcpy(skb_put(skb, sizeof(ridrq)), &ridrq, sizeof(ridrq));
+
+	res = hfa384x_usbout(dev, skb);
+	if (res) {
+		dev_kfree_skb(skb);
+		return res;
+	}
+
+	res = hfa384x_wait(dev, skb);
+
+	respskb = hfa384x_cb(skb)->response;
+	if (!respskb) {
+		res = -EIO;
+	}
+
+	if (!res) {
+		rlen = le16_to_cpu(*(u16*)(respskb->data));
+		skb_pull(respskb, 2);
+		rlen = (rlen - 1) * 2;
+	}
+
+	if (!res && exact_len && rlen != len) {
+		printk(KERN_DEBUG "%s: hfa384x_get_rid - RID len mismatch: "
+		       "rid=0x%04x, len=%d (expected %d)\n",
+		       dev->name, rid, rlen, len);
+		res = -ENODATA;
+	}
+
+	if (!res) {
+		skb_pull(respskb, 2); /* skip RID */
+		memcpy(buf, respskb->data, len);
+	}
+
+	if (respskb);
+		dev_kfree_skb(respskb);
+	dev_kfree_skb(skb);
+
+	if (res) {
+		if (res != -ENODATA)
+			printk(KERN_DEBUG "%s: hfa384x_get_rid (rid=%04x, "
+			       "len=%d) - failed - res=%d\n", dev->name, rid,
+			       len, res);
+		if (res == -ETIMEDOUT)
+			prism2_hw_reset(dev);
+		return res;
+	}
+
+	return rlen;
+}
+
+static int hfa384x_set_rid(struct net_device *dev, u16 rid, void *buf, int len) {
+	struct hostap_interface *iface;
+	local_info_t *local;
+	int res;
+	struct sk_buff *skb;
+	struct hfa384x_wrid_req ridrq;
+
+	iface = netdev_priv(dev);
+	local = iface->local;
+
+	if (local->no_pri) {
+		printk(KERN_DEBUG "%s: cannot set RID %04x (len=%d) - no PRI "
+		       "f/w\n", dev->name, rid, len);
+		return -ENOTTY; /* Well.. not really correct, but return
+				 * something unique enough.. */
+	}
+
+	if ((local->func->card_present && !local->func->card_present(local)) ||
+	    local->hw_downloading)
+		return -ENODEV;
+
+	skb = ALLOC_TX_SKB(sizeof(ridrq) + len + 1);
+	if (!skb)
+		return -ENOMEM;
+
+	memset(&ridrq, 0, sizeof(ridrq));
+	ridrq.type = cpu_to_le16(HFA384x_USB_TYPE_WRRID);
+	/* RID len in words and +1 for rec.rid */
+	ridrq.frmlen = cpu_to_le16((len + 1) / 2 + 1);
+	ridrq.rid = cpu_to_le16(rid);
+
+	memcpy(skb_put(skb, sizeof(ridrq)), &ridrq, sizeof(ridrq));
+	memcpy(skb_put(skb, len), buf, len);
+	if (len % 2)
+		*skb_put(skb, 1) = 0;
+
+	res = hfa384x_usbout(dev, skb);
+	if (res) {
+		dev_kfree_skb(skb);
+		return res;
+	}
+
+	res = hfa384x_wait(dev, skb);
+
+	dev_kfree_skb(skb);
+
+	if (res) {
+		if (res != -ENODATA)
+			printk(KERN_DEBUG "%s: hfa384x_get_rid (rid=%04x, "
+			       "len=%d) - failed - res=%d\n", dev->name, rid,
+			       len, res);
+		if (res == -ETIMEDOUT)
+			prism2_hw_reset(dev);
+	}
+
+	return res;
+}
+
 static int hfa384x_cmd_issue(struct net_device *dev,
 				    struct hostap_cmd_queue *entry)
 {
-	return -EINVAL;
+	struct hostap_interface *iface;
+	local_info_t *local;
+	struct sk_buff *skb;
+	struct hfa384x_cmd_req cmd;
+	struct hostap_usb_priv *hw_priv;
+	int ret = 0;
+
+	printk(KERN_DEBUG "%s cmd %d\n", dev_info, entry->cmd);
+
+	iface = netdev_priv(dev);
+	local = iface->local;
+	hw_priv =  local->hw_priv;
+
+	if (local->func->card_present && !local->func->card_present(local))
+		return -ENODEV;
+
+	if (entry->issued) {
+		printk(KERN_DEBUG "%s: driver bug - re-issuing command @%p\n",
+		       dev->name, entry);
+	}
+
+	skb = ALLOC_TX_SKB(sizeof(cmd));
+	if (!skb)
+		return -ENOMEM;
+
+	memset(&cmd, 0, sizeof(cmd));
+	cmd.type = cpu_to_le16(HFA384x_USB_TYPE_CMD);
+	cmd.cmd = entry->cmd;
+	cmd.param0 = entry->param0;
+	cmd.param1 = entry->param1;
+	cmd.param2 = 0;
+	memcpy(skb_put(skb, sizeof(cmd)), &cmd, sizeof(cmd));
+
+	ret = hfa384x_usbout(dev, skb);
+
+	// FIXME: support timeouts for commands (not here, in a timer!)
+
+	if (!ret)
+		entry->issued = 1;
+
+	return ret;
 }
 static int prism2_tx_80211(struct sk_buff *skb, struct net_device *dev)
 {
@@ -134,12 +515,20 @@ static int prism2_hw_init(struct net_device *dev, int initial)
 {
 	struct hostap_interface *iface;
 	local_info_t *local;
+	struct hostap_usb_priv *hw_priv;
 	int ret;
 
 	PDEBUG(DEBUG_FLOW, "prism2_hw_init()\n");
 
 	iface = netdev_priv(dev);
 	local = iface->local;
+	hw_priv = local->hw_priv;
+
+	if (!initial)
+		usb_kill_urb(&hw_priv->rx_urb);
+	ret = hfa384x_submit_rx_urb(dev, GFP_KERNEL);
+	if (ret)
+		return 1;
 
 	clear_bit(HOSTAP_BITS_TRANSMIT, &local->bits);
 
@@ -151,11 +540,12 @@ static int prism2_hw_init(struct net_device *dev, int initial)
 		       dev_info);
 		local->no_pri = 1;
 #ifdef PRISM2_DOWNLOAD_SUPPORT
-			if (local->sram_type == -1)
-				local->sram_type = prism2_get_ram_size(local);
+		if (local->sram_type == -1)
+			local->sram_type = prism2_get_ram_size(local);
 #endif /* PRISM2_DOWNLOAD_SUPPORT */
 		return 1;
 	}
+	msleep(100);
 	local->no_pri = 0;
 	return 0;
 }
@@ -163,10 +553,94 @@ static int prism2_hw_init(struct net_device *dev, int initial)
 /* FIX: This might change at some point.. */
 #include "hostap_hw.c"
 
+static void hfa384x_usbin_callback(struct urb *urb)
+{
+	struct net_device *dev = urb->context;
+	struct hostap_interface *iface = netdev_priv(dev);
+	local_info_t *local = iface->local;
+	struct hostap_usb_priv *hw_priv = local->hw_priv;
+	struct sk_buff *skb;
+	struct sk_buff *oldskb;
+	u16 type;
+
+	printk(KERN_DEBUG "hostap_usb urbin received!\n");
+
+	skb = hw_priv->rx_skb;
+	hw_priv->rx_skb = NULL;
+	BUG_ON(!skb || skb->data != urb->transfer_buffer);
+
+	switch (urb->status) {
+	case 0:
+		break;
+	case -EPIPE:
+		printk(KERN_ERR "rx pipe stall\n");
+		break;
+	default:
+		printk(KERN_ERR "rx %d\n", urb->status);
+		break;
+	}
+
+	// FIXME
+	if (urb->status) {
+		dev_kfree_skb(skb);
+		return;
+	}
+
+	skb_put(skb, urb->actual_length);
+	print_hex_dump_bytes("urb ", DUMP_PREFIX_OFFSET, skb->data, skb->len);
+
+	type = le16_to_cpu(*(u16*)(skb->data));
+	printk(KERN_DEBUG "%s: type %04x\n", dev_info, type);
+	if (type & 0x8000) {
+		skb_pull(skb, 2);
+		switch (type &~0x8000) {
+		case HFA384x_USB_TYPE_CMD:
+			prism2_cmd_ev(dev, skb);
+			dev_kfree_skb(skb);
+			/* nobody is waiting for commands */
+			dev_kfree_skb(skb_dequeue(&hw_priv->tx_queue));
+			hfa384x_usbout(dev, NULL);
+			break;
+		case HFA384x_USB_TYPE_WRRID:
+			oldskb = skb_dequeue(&hw_priv->tx_queue);
+			dev_kfree_skb(skb); /* no response expected */
+			complete_all(&hfa384x_cb(oldskb)->comp);
+			hfa384x_usbout(dev, NULL);
+			break;
+		case HFA384x_USB_TYPE_RDRID:
+			oldskb = skb_dequeue(&hw_priv->tx_queue);
+			hfa384x_cb(oldskb)->response = skb;
+			complete_all(&hfa384x_cb(oldskb)->comp);
+			hfa384x_usbout(dev, NULL);
+			break;
+		default:
+			dev_kfree_skb(skb);
+			break;
+		}
+	} else {
+		// FIXME: handle back tx completition
+		// FIXME: handle RX errors (len, see prism2_rx)
+		skb_queue_tail(&local->rx_list, skb);
+		tasklet_schedule(&local->rx_tasklet);
+	}
+	// FIXME: handle erroneus statuses
+	if (urb->status == 0)
+		hfa384x_submit_rx_urb(dev, GFP_ATOMIC);
+}
+
+
+static void prism2_usb_cor_sreset(local_info_t *local)
+{
+	struct hostap_usb_priv *hw_priv = local->hw_priv;
+
+	printk(KERN_INFO "%s: resetting device %p\n", dev_info, hw_priv->usb);
+//	usb_reset_device(hw_priv->usb);
+}
+
 static struct prism2_helper_functions prism2_usb_funcs =
 {
 //	.card_present	= prism2_usb_card_present,
-//	.cor_sreset	= prism2_usb_cor_sreset,
+	.cor_sreset	= prism2_usb_cor_sreset,
 //	.genesis_reset	= prism2_usb_genesis_reset,
 	.hw_type	= HOSTAP_HW_USB,
 };
@@ -188,6 +662,12 @@ static int prism2_usb_probe(struct usb_interface *interface,
 
 	usb = interface_to_usbdev(interface);
 
+	hw_priv->endp_in = usb_rcvbulkpipe(usb, 1);
+	hw_priv->endp_out = usb_sndbulkpipe(usb, 2);
+	usb_init_urb(&hw_priv->tx_urb);
+	usb_init_urb(&hw_priv->rx_urb);
+	skb_queue_head_init(&hw_priv->tx_queue);
+
 	dev = prism2_init_local_data(&prism2_usb_funcs, cards_found,
 				     &interface->dev);
 	if (dev == NULL)
@@ -197,24 +677,29 @@ static int prism2_usb_probe(struct usb_interface *interface,
 	local->hw_priv = hw_priv;
 	cards_found++;
 
-//	prism2_usb_cor_sreset(local);
-
 	hw_priv->usb = usb_get_dev(usb);
+
+	prism2_usb_cor_sreset(local);
 
 	usb_set_intfdata(interface, dev);
 
 	if (!local->pri_only && prism2_hw_config(dev, 1)) {
 		printk(KERN_DEBUG "%s: hardware initialization failed\n",
 		       dev_info);
-		goto fail;
+		goto fail2;
 	}
 
 	printk(KERN_INFO "%s: Intersil Prism2/2.5/3 USB", dev->name);
 
 	return hostap_hw_ready(dev);
 
+fail2:
+	usb_put_dev(hw_priv->usb);
  fail:
 	prism2_free_local_data(dev);
+
+	usb_kill_urb(&hw_priv->rx_urb);
+	usb_kill_urb(&hw_priv->tx_urb);
 
 // err_out_free:
 	kfree(hw_priv);
@@ -233,9 +718,11 @@ static void prism2_usb_disconnect(struct usb_interface *interface)
 		iface = netdev_priv(dev);
 		hw_priv = iface->local->hw_priv;
 
+		usb_kill_urb(&hw_priv->rx_urb);
+		usb_kill_urb(&hw_priv->tx_urb);
+
 		/* Reset the hardware, and ensure interrupts are disabled. */
-//		prism2_usb_cor_sreset(iface->local);
-//		hfa384x_disable_interrupts(dev);
+		prism2_usb_cor_sreset(iface->local);
 
 		prism2_free_local_data(dev);
 		/* FIXME: or before free_local_data ? */
@@ -287,6 +774,7 @@ static struct usb_driver prism2_usb_driver = {
 
 static int __init prism2usb_init(void)
 {
+	BUILD_BUG_ON(sizeof(struct hostap_usb_skb_cb) > sizeof(((struct sk_buff*)NULL)->cb));
 	return usb_register(&prism2_usb_driver);
 };
 

@@ -657,6 +657,7 @@ static inline int hfa384x_cmd_no_wait(struct net_device *dev, u16 cmd,
 {
 	return __hfa384x_cmd_no_wait(dev, cmd, param0, 6);
 }
+#endif
 
 
 /**
@@ -669,7 +670,11 @@ static inline int hfa384x_cmd_no_wait(struct net_device *dev, u16 cmd,
  * either wake up the sleeping process that is waiting for command completion
  * or call the callback function. Issue the next command, if one is pending.
  */
+#ifndef PRISM2_USB
 static void prism2_cmd_ev(struct net_device *dev)
+#else
+static void prism2_cmd_ev(struct net_device *dev, struct sk_buff *skb)
+#endif
 {
 	struct hostap_interface *iface;
 	local_info_t *local;
@@ -696,17 +701,28 @@ static void prism2_cmd_ev(struct net_device *dev)
 	spin_unlock(&local->cmdlock);
 
 	if (!entry) {
+#ifndef PRISM2_USB
 		HFA384X_OUTW(HFA384X_EV_CMD, HFA384X_EVACK_OFF);
+#endif
 		printk(KERN_DEBUG "%s: Command completion event, but no "
 		       "pending commands\n", dev->name);
 		return;
 	}
 
+#ifndef PRISM2_USB
 	entry->resp0 = HFA384X_INW(HFA384X_RESP0_OFF);
 	entry->res = (HFA384X_INW(HFA384X_STATUS_OFF) &
 		      (BIT(14) | BIT(13) | BIT(12) | BIT(11) | BIT(10) |
 		       BIT(9) | BIT(8))) >> 8;
 	HFA384X_OUTW(HFA384X_EV_CMD, HFA384X_EVACK_OFF);
+#else
+	entry->res = (__le16_to_cpu(*(u16*)(skb->data)) &
+		      (BIT(14) | BIT(13) | BIT(12) | BIT(11) | BIT(10) |
+		       BIT(9) | BIT(8))) >> 8;
+	skb_pull(skb, 2);
+	entry->resp0 = __le16_to_cpu(*(u16*)(skb->data));
+	skb_pull(skb, 2);
+#endif
 
 	/* TODO: rest of the CmdEv handling could be moved to tasklet */
 	if (entry->type == CMD_SLEEP) {
@@ -749,6 +765,7 @@ static void prism2_cmd_ev(struct net_device *dev)
 }
 
 
+#ifndef PRISM2_USB
 static int hfa384x_wait_offset(struct net_device *dev, u16 o_off)
 {
 	int tries = HFA384X_BAP_BUSY_TIMEOUT;
@@ -1396,11 +1413,6 @@ static int prism2_alloc_txfid(struct net_device *dev)
 
 	return 0;
 }
-#else
-static int prism2_alloc_txfid(struct net_device *dev)
-{
-	return 0;
-}
 #endif
 
 static int prism2_hw_init2(struct net_device *dev, int initial)
@@ -1451,8 +1463,10 @@ static int prism2_hw_init2(struct net_device *dev, int initial)
 		hfa384x_disable_interrupts(dev);
 	}
 
+#ifndef PRISM2_USB
 	if (prism2_alloc_txfid(dev))
 		goto failed;
+#endif
 
 	hfa384x_events_only_cmd(dev);
 
