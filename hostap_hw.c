@@ -716,6 +716,7 @@ static void prism2_cmd_ev(struct net_device *dev, struct sk_buff *skb)
 		       BIT(9) | BIT(8))) >> 8;
 	HFA384X_OUTW(HFA384X_EV_CMD, HFA384X_EVACK_OFF);
 #else
+	skb_pull(skb, 2);
 	entry->res = (__le16_to_cpu(*(u16*)(skb->data)) &
 		      (BIT(14) | BIT(13) | BIT(12) | BIT(11) | BIT(10) |
 		       BIT(9) | BIT(8))) >> 8;
