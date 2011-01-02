@@ -31,9 +31,16 @@ struct hostap_usb_priv {
 	struct sk_buff_head tx_queue;
 };
 
+typedef void (*hostap_urb_calb)(struct net_device *dev, struct sk_buff *req);
+
 struct hostap_usb_skb_cb {
 	struct completion comp;
 	struct sk_buff *response;
+	hostap_urb_calb calb;
+	unsigned error : 1,
+		 acked : 1,
+		 noresp : 1,
+		 issued : 1;
 };
 
 static inline struct hostap_usb_skb_cb *hfa384x_cb(struct sk_buff *skb)
@@ -178,35 +185,7 @@ struct hfa384x_wrid_req {
 } __packed;
 
 
-static void hfa384x_usbout_callback(struct urb *urb)
-{
-	struct net_device *dev = urb->context;
-	struct hostap_interface *iface = netdev_priv(dev);
-	local_info_t *local = iface->local;
-	struct hostap_usb_priv *hw_priv = local->hw_priv;
-	struct sk_buff *skb;
-
-	printk(KERN_DEBUG "hostap_usb urbout received!\n");
-	switch (urb->status) {
-	case 0:
-		break;
-	case -EPIPE:
-		printk(KERN_ERR "tx pipe stall\n");
-		break;
-	default:
-		printk(KERN_ERR "tx %d\n", urb->status);
-		break;
-	}
-
-	// FIXME
-	if (urb->status != 0) {
-		skb = skb_dequeue(&hw_priv->tx_queue);
-		complete_all(&hfa384x_cb(skb)->comp);
-		return;
-	}
-
-	printk(KERN_DEBUG "type %04x\n", *(u16*)(urb->transfer_buffer));
-}
+static void hfa384x_usbout_callback(struct urb *urb);
 
 static void hfa384x_usbin_callback(struct urb *urb);
 
@@ -244,15 +223,13 @@ static int hfa384x_submit_rx_urb(struct net_device *dev, gfp_t flags)
 	return ret;
 }
 
-static int hfa384x_submit_tx_urb(struct net_device *dev, gfp_t flags)
+static int hfa384x_submit_tx_urb(struct net_device *dev, struct sk_buff *skb, gfp_t flags)
 {
 	struct hostap_interface *iface = netdev_priv(dev);
 	local_info_t *local = iface->local;
 	struct hostap_usb_priv *hw_priv = local->hw_priv;
-	struct sk_buff *skb;
 	int ret;
 
-	skb = skb_peek(&hw_priv->tx_queue);
 	BUG_ON(!skb);
 
 	usb_fill_bulk_urb(&hw_priv->tx_urb, hw_priv->usb,
@@ -279,21 +256,31 @@ static int hfa384x_usbout(struct net_device *dev, struct sk_buff *skb)
 	local_info_t *local = iface->local;
 	struct hostap_usb_priv *hw_priv = local->hw_priv;
 	unsigned long flags;
-	int start_tx = 0;
+	struct sk_buff *for_tx;
 
 	spin_lock_irqsave(&hw_priv->tx_queue.lock, flags);
+
 	if (skb) {
 		init_completion(&hfa384x_cb(skb)->comp);
 		hfa384x_cb(skb)->response = NULL;
+		hfa384x_cb(skb)->error = 0;
+		hfa384x_cb(skb)->acked = 0;
+		hfa384x_cb(skb)->issued = 0;
 		__skb_queue_tail(&hw_priv->tx_queue, skb);
 	}
-	printk(KERN_DEBUG "usbout: %p\n", skb);
-	if (skb_queue_len(&hw_priv->tx_queue) == 1)
-		 start_tx = 1;
+
+	for_tx = skb_peek(&hw_priv->tx_queue);
+	if (for_tx && !hfa384x_cb(for_tx)->issued)
+		hfa384x_cb(for_tx)->issued = 1;
+	else
+		for_tx = NULL;
+
+	printk(KERN_DEBUG "usbout: %p %d %d\n", skb, skb_queue_len(&hw_priv->tx_queue),
+			for_tx ? 1 : 0);
 	spin_unlock_irqrestore(&hw_priv->tx_queue.lock, flags);
 
-	if (start_tx)
-		return hfa384x_submit_tx_urb(dev, GFP_ATOMIC);
+	if (for_tx)
+		return hfa384x_submit_tx_urb(dev, for_tx, GFP_ATOMIC);
 
 	return 0;
 }
@@ -356,6 +343,8 @@ static int hfa384x_get_rid(struct net_device *dev, u16 rid, void *buf, int len,
 
 	memcpy(skb_put(skb, sizeof(ridrq)), &ridrq, sizeof(ridrq));
 
+	hfa384x_cb(skb)->calb = NULL;
+	hfa384x_cb(skb)->noresp = 0;
 	res = hfa384x_usbout(dev, skb);
 	if (res) {
 		dev_kfree_skb(skb);
@@ -387,7 +376,7 @@ static int hfa384x_get_rid(struct net_device *dev, u16 rid, void *buf, int len,
 		memcpy(buf, respskb->data, len);
 	}
 
-	if (respskb);
+	if (respskb)
 		dev_kfree_skb(respskb);
 	dev_kfree_skb(skb);
 
@@ -440,6 +429,8 @@ static int hfa384x_set_rid(struct net_device *dev, u16 rid, void *buf, int len) 
 	if (len % 2)
 		*skb_put(skb, 1) = 0;
 
+	hfa384x_cb(skb)->calb = NULL;
+	hfa384x_cb(skb)->noresp = 0;
 	res = hfa384x_usbout(dev, skb);
 	if (res) {
 		dev_kfree_skb(skb);
@@ -448,6 +439,8 @@ static int hfa384x_set_rid(struct net_device *dev, u16 rid, void *buf, int len) 
 
 	res = hfa384x_wait(dev, skb);
 
+	if (hfa384x_cb(skb)->response)
+		dev_kfree_skb(hfa384x_cb(skb)->response);
 	dev_kfree_skb(skb);
 
 	if (res) {
@@ -461,6 +454,8 @@ static int hfa384x_set_rid(struct net_device *dev, u16 rid, void *buf, int len) 
 
 	return res;
 }
+
+static void hfa384x_usb_cmd_callback(struct net_device *dev, struct sk_buff *skb);
 
 static int hfa384x_cmd_issue(struct net_device *dev,
 				    struct hostap_cmd_queue *entry)
@@ -498,6 +493,8 @@ static int hfa384x_cmd_issue(struct net_device *dev,
 	cmd.param2 = 0;
 	memcpy(skb_put(skb, sizeof(cmd)), &cmd, sizeof(cmd));
 
+	hfa384x_cb(skb)->calb = hfa384x_usb_cmd_callback;
+	hfa384x_cb(skb)->noresp = 0;
 	ret = hfa384x_usbout(dev, skb);
 
 	// FIXME: support timeouts for commands (not here, in a timer!)
@@ -576,6 +573,138 @@ static void prism2_info(local_info_t *local, struct sk_buff *skb)
 /* FIX: This might change at some point.. */
 #include "hostap_hw.c"
 
+static void hfa384x_usb_cmd_callback(struct net_device *dev, struct sk_buff *skb)
+{
+	// FIXME: handle error cases
+	if (hfa384x_cb(skb)->response) {
+		prism2_cmd_ev(dev, hfa384x_cb(skb)->response);
+		dev_kfree_skb(hfa384x_cb(skb)->response);
+	}
+	dev_kfree_skb(skb);
+}
+
+static bool hfa384x_check_ctrl_response(struct net_device *dev, struct sk_buff *skb)
+{
+	struct hostap_interface *iface = netdev_priv(dev);
+	local_info_t *local = iface->local;
+	struct hostap_usb_priv *hw_priv = local->hw_priv;
+	struct sk_buff *reqskb;
+	unsigned long flags;
+	bool ret = false;
+
+	spin_lock_irqsave(&hw_priv->tx_queue.lock, flags);
+
+	reqskb = skb_peek(&hw_priv->tx_queue);
+	if (!reqskb || hfa384x_cb(reqskb)->response)
+		goto out;
+
+	if (hfa384x_cb(reqskb)->response)
+		goto out;
+
+	if ((reqskb->data[0] != skb->data[0]) || ((reqskb->data[1] | 0x80) != skb->data[1]))
+		goto out;
+
+	hfa384x_cb(reqskb)->response = skb;
+	ret = true;
+out:
+	spin_unlock_irqrestore(&hw_priv->tx_queue.lock, flags);
+
+	return ret;
+}
+
+static void hfa384x_process_reqs(struct net_device *dev) {
+	struct hostap_interface *iface = netdev_priv(dev);
+	local_info_t *local = iface->local;
+	struct hostap_usb_priv *hw_priv = local->hw_priv;
+	unsigned long flags;
+	struct sk_buff *skb;
+	int process = 0;
+	int err = 0;
+
+	printk(KERN_DEBUG "process_reqs\n");
+	spin_lock_irqsave(&hw_priv->tx_queue.lock, flags);
+	skb = skb_peek(&hw_priv->tx_queue);
+
+	if (skb && (hfa384x_cb(skb)->error ||
+			(hfa384x_cb(skb)->acked &&
+			 (hfa384x_cb(skb)->response || hfa384x_cb(skb)->noresp)))) {
+		process = 1;
+		__skb_unlink(skb, &hw_priv->tx_queue);
+	}
+
+	printk(KERN_DEBUG "process_reqs %d %d %d %d %p\n",
+			process,
+			skb ? hfa384x_cb(skb)->error : -1,
+			skb ? hfa384x_cb(skb)->acked: -1,
+			skb ? hfa384x_cb(skb)->noresp: -1,
+			skb ? hfa384x_cb(skb)->response: (void*)-1
+			);
+
+	print_hex_dump_bytes("pr ", DUMP_PREFIX_OFFSET, skb->data, skb->len);
+	spin_unlock_irqrestore(&hw_priv->tx_queue.lock, flags);
+
+	if (process) {
+		hostap_urb_calb urb_calb = hfa384x_cb(skb)->calb;
+		if (hfa384x_cb(skb)->error)
+			err = 1;
+
+		complete_all(&hfa384x_cb(skb)->comp);
+		if (urb_calb)
+			(*urb_calb)(dev, skb);
+
+		if (!err)
+			hfa384x_usbout(dev, NULL);
+	}
+
+	return;
+
+}
+
+static void hfa384x_usbout_callback(struct urb *urb)
+{
+	struct net_device *dev = urb->context;
+	struct hostap_interface *iface = netdev_priv(dev);
+	local_info_t *local = iface->local;
+	struct hostap_usb_priv *hw_priv = local->hw_priv;
+	struct sk_buff *skb;
+	unsigned long flags;
+
+	printk(KERN_DEBUG "hostap_usb urbout received!\n");
+	switch (urb->status) {
+	case 0:
+		break;
+	case -EPIPE:
+		printk(KERN_ERR "tx pipe stall\n");
+		break;
+	default:
+		printk(KERN_ERR "tx %d\n", urb->status);
+		break;
+	}
+
+	spin_lock_irqsave(&hw_priv->tx_queue.lock, flags);
+	if (WARN_ON(!urb))
+		goto out;
+	if (WARN_ON(!urb->transfer_buffer))
+		goto out;
+	printk(KERN_DEBUG "type %04x\n", *(u16*)(urb->transfer_buffer));
+	skb = skb_peek(&hw_priv->tx_queue);
+	if (!skb) {
+		printk(KERN_ERR "usbout but no skb in queue!\n");
+		goto out;
+	}
+
+	if (urb->status != 0)
+		hfa384x_cb(skb)->error = 1;
+		// FIXME: submit next from tx_queue ?
+	else
+		hfa384x_cb(skb)->acked = 1;
+
+out:
+	spin_unlock_irqrestore(&hw_priv->tx_queue.lock, flags);
+
+	hfa384x_process_reqs(dev);
+}
+
 static void hfa384x_usbin_callback(struct urb *urb)
 {
 	struct net_device *dev = urb->context;
@@ -583,7 +712,6 @@ static void hfa384x_usbin_callback(struct urb *urb)
 	local_info_t *local = iface->local;
 	struct hostap_usb_priv *hw_priv = local->hw_priv;
 	struct sk_buff *skb;
-	struct sk_buff *oldskb;
 	u16 type;
 
 	printk(KERN_DEBUG "hostap_usb urbin received!\n");
@@ -612,46 +740,40 @@ static void hfa384x_usbin_callback(struct urb *urb)
 	skb_put(skb, urb->actual_length);
 	print_hex_dump_bytes("urb ", DUMP_PREFIX_OFFSET, skb->data, skb->len);
 
+	if (skb->len < 2) {
+		printk(KERN_ERR "%s: %s urbin too short!\n", dev_info, dev->name);
+		hfa384x_submit_rx_urb(dev, GFP_ATOMIC);
+		return;
+	}
+
 	type = le16_to_cpu(*(u16*)(skb->data));
 	printk(KERN_DEBUG "%s: type %04x\n", dev_info, type);
+
 	if (type & 0x8000) {
-		skb_pull(skb, 2);
-		switch (type &~0x8000) {
+		if (hfa384x_check_ctrl_response(dev, skb)) {
+			hfa384x_process_reqs(dev);
+			hfa384x_submit_rx_urb(dev, GFP_ATOMIC);
+			return;
+		}
+
+		switch (type & ~0x8000) {
 		case HFA384x_USB_TYPE_INFO:
+			skb_pull(skb, 2);
 			prism2_info(local, skb);
-			break;
-		case HFA384x_USB_TYPE_CMD:
-			prism2_cmd_ev(dev, skb);
-			dev_kfree_skb(skb);
-			/* nobody is waiting for commands */
-			dev_kfree_skb(skb_dequeue(&hw_priv->tx_queue));
-			hfa384x_usbout(dev, NULL);
-			break;
-		case HFA384x_USB_TYPE_WRRID:
-			oldskb = skb_dequeue(&hw_priv->tx_queue);
-			dev_kfree_skb(skb); /* no response expected */
-			complete_all(&hfa384x_cb(oldskb)->comp);
-			hfa384x_usbout(dev, NULL);
-			break;
-		case HFA384x_USB_TYPE_RDRID:
-			oldskb = skb_dequeue(&hw_priv->tx_queue);
-			hfa384x_cb(oldskb)->response = skb;
-			complete_all(&hfa384x_cb(oldskb)->comp);
-			hfa384x_usbout(dev, NULL);
 			break;
 		default:
 			dev_kfree_skb(skb);
 			break;
 		}
+
 	} else {
 		// FIXME: handle back tx completition
 		// FIXME: handle RX errors (len, see prism2_rx)
 		skb_queue_tail(&local->rx_list, skb);
 		tasklet_schedule(&local->rx_tasklet);
 	}
-	// FIXME: handle erroneus statuses
-	if (urb->status == 0)
-		hfa384x_submit_rx_urb(dev, GFP_ATOMIC);
+
+	hfa384x_submit_rx_urb(dev, GFP_ATOMIC);
 }
 
 static int prism2_usb_card_present(local_info_t *local)
