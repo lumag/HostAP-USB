@@ -582,6 +582,20 @@ static void prism2_info(local_info_t *local, struct sk_buff *skb)
 	}
 }
 
+static void handle_reset_queue(struct work_struct *work)
+{
+	local_info_t *local = container_of(work, local_info_t, reset_queue);
+
+	printk(KERN_DEBUG "%s: scheduled card reset\n", local->dev->name);
+	prism2_hw_reset(local->dev);
+
+	if (netif_queue_stopped(local->dev)) {
+		PDEBUG(DEBUG_EXTRA, "prism2_tx_timeout: "
+		       "wake up queue\n");
+		netif_wake_queue(local->dev);
+	}
+}
+
 /* FIX: This might change at some point.. */
 #include "hostap_hw.c"
 

@@ -1691,6 +1691,7 @@ static void prism2_schedule_reset(local_info_t *local)
 }
 
 
+#ifndef PRISM2_USB
 /* Called only as scheduled task after noticing card timeout in interrupt
  * context */
 static void handle_reset_queue(struct work_struct *work)
@@ -1714,7 +1715,6 @@ static void handle_reset_queue(struct work_struct *work)
 }
 
 
-#ifndef PRISM2_USB
 static int prism2_get_txfid_idx(local_info_t *local)
 {
 	int idx, end;
