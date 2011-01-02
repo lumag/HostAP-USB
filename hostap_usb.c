@@ -24,6 +24,7 @@ struct hostap_usb_priv {
 	struct usb_device *usb;
 	int endp_in;
 	int endp_out;
+	int present;
 	struct urb rx_urb;
 	struct urb tx_urb;
 	struct sk_buff *rx_skb;
@@ -653,6 +654,14 @@ static void hfa384x_usbin_callback(struct urb *urb)
 		hfa384x_submit_rx_urb(dev, GFP_ATOMIC);
 }
 
+static int prism2_usb_card_present(local_info_t *local)
+{
+	struct hostap_usb_priv *hw_priv = local->hw_priv;
+	if (hw_priv != NULL && hw_priv->usb != NULL && hw_priv->present)
+		return 1;
+	printk(KERN_ERR "Device not present!!!\n");
+	return 0;
+}
 
 static void prism2_usb_cor_sreset(local_info_t *local)
 {
@@ -664,7 +673,7 @@ static void prism2_usb_cor_sreset(local_info_t *local)
 
 static struct prism2_helper_functions prism2_usb_funcs =
 {
-//	.card_present	= prism2_usb_card_present,
+	.card_present	= prism2_usb_card_present,
 	.cor_sreset	= prism2_usb_cor_sreset,
 //	.genesis_reset	= prism2_usb_genesis_reset,
 	.hw_type	= HOSTAP_HW_USB,
@@ -691,6 +700,7 @@ static int prism2_usb_probe(struct usb_interface *interface,
 	hw_priv->endp_out = usb_sndbulkpipe(usb, 2);
 	usb_init_urb(&hw_priv->tx_urb);
 	usb_init_urb(&hw_priv->rx_urb);
+	hw_priv->present = 1;
 	skb_queue_head_init(&hw_priv->tx_queue);
 
 	dev = prism2_init_local_data(&prism2_usb_funcs, cards_found,
@@ -721,6 +731,7 @@ static int prism2_usb_probe(struct usb_interface *interface,
 fail2:
 	usb_put_dev(hw_priv->usb);
  fail:
+	hw_priv->present = 0;
 	prism2_free_local_data(dev);
 
 	usb_kill_urb(&hw_priv->rx_urb);
@@ -743,6 +754,7 @@ static void prism2_usb_disconnect(struct usb_interface *interface)
 		iface = netdev_priv(dev);
 		hw_priv = iface->local->hw_priv;
 
+		hw_priv->present = 0;
 		usb_kill_urb(&hw_priv->rx_urb);
 		usb_kill_urb(&hw_priv->tx_urb);
 
