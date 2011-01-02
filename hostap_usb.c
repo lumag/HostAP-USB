@@ -576,6 +576,7 @@ static void prism2_info(local_info_t *local, struct sk_buff *skb)
 		       len, type);
 		dev_kfree_skb(skb);
 	} else {
+		skb_trim(skb, 2 + 2 * len);
 		skb_queue_tail(&local->info_list, skb);
 		tasklet_schedule(&local->info_tasklet);
 	}
