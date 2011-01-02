@@ -314,7 +314,7 @@ static int hfa384x_get_rid(struct net_device *dev, u16 rid, void *buf, int len,
 			   int exact_len) {
 	struct hostap_interface *iface;
 	local_info_t *local;
-	int res, rlen = 0;
+	int res, rrid, rlen = 0;
 	struct sk_buff *skb, *respskb;
 	struct hfa384x_rrid_req ridrq;
 
@@ -359,6 +359,7 @@ static int hfa384x_get_rid(struct net_device *dev, u16 rid, void *buf, int len,
 	}
 
 	if (!res) {
+		skb_pull(respskb, 2);
 		rlen = le16_to_cpu(*(u16*)(respskb->data));
 		skb_pull(respskb, 2);
 		rlen = (rlen - 1) * 2;
@@ -369,6 +370,16 @@ static int hfa384x_get_rid(struct net_device *dev, u16 rid, void *buf, int len,
 		       "rid=0x%04x, len=%d (expected %d)\n",
 		       dev->name, rid, rlen, len);
 		res = -ENODATA;
+	}
+
+	if (!res) {
+		rrid = le16_to_cpu(*(u16*)(respskb->data));
+		if (rrid != rid) {
+			printk(KERN_DEBUG "%s: hfa384x_get_rid - RID mismatch: "
+			       "rid=0x%04x, got 0x%04x)\n",
+			       dev->name, rid, rrid);
+			res = -ENODATA;
+		}
 	}
 
 	if (!res) {
