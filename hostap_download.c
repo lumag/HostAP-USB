@@ -1,3 +1,4 @@
+#ifndef PRISM2_USB
 static int prism2_enable_aux_port(struct net_device *dev, int enable)
 {
 	u16 val, reg;
@@ -143,6 +144,7 @@ static int hfa384x_to_aux(struct net_device *dev, unsigned int addr, int len,
 
 	return 0;
 }
+#endif
 
 
 static int prism2_pda_ok(u8 *buf)
@@ -274,6 +276,7 @@ static int prism2_download_volatile(local_info_t *local,
 	param0 = param->start_addr & 0xffff;
 	param1 = param->start_addr >> 16;
 
+#ifndef PRISM2_USB
 	HFA384X_OUTW(0, HFA384X_PARAM2_OFF);
 	HFA384X_OUTW(param1, HFA384X_PARAM1_OFF);
 	if (hfa384x_cmd_wait(dev, HFA384X_CMDCODE_DOWNLOAD |
@@ -284,6 +287,16 @@ static int prism2_download_volatile(local_info_t *local,
 		ret = -1;
 		goto out;
 	}
+#else
+	if (hfa384x_cmd_simple(dev, HFA384X_CMDCODE_DOWNLOAD |
+			     (HFA384X_PROGMODE_ENABLE_VOLATILE << 8),
+			     param0, param1, 0)) {
+		printk(KERN_WARNING "%s: Download command execution failed\n",
+		       dev->name);
+		ret = -1;
+		goto out;
+	}
+#endif
 
 	for (i = 0; i < param->num_areas; i++) {
 		PDEBUG(DEBUG_EXTRA2, "%s: Writing %d bytes at 0x%08x\n",
@@ -298,6 +311,7 @@ static int prism2_download_volatile(local_info_t *local,
 		}
 	}
 
+#ifndef PRISM2_USB
 	HFA384X_OUTW(param1, HFA384X_PARAM1_OFF);
 	HFA384X_OUTW(0, HFA384X_PARAM2_OFF);
 	if (hfa384x_cmd_no_wait(dev, HFA384X_CMDCODE_DOWNLOAD |
@@ -307,11 +321,24 @@ static int prism2_download_volatile(local_info_t *local,
 		ret = -1;
 		goto out;
 	}
+#else
+	// FIXME: no wait
+	if (hfa384x_cmd_simple(dev, HFA384X_CMDCODE_DOWNLOAD |
+				(HFA384X_PROGMODE_DISABLE << 8), param0,
+				param1, 0)) {
+		printk(KERN_WARNING "%s: Download command execution failed\n",
+		       dev->name);
+		ret = -1;
+		goto out;
+	}
+#endif
 	/* ProgMode disable causes the hardware to restart itself from the
 	 * given starting address. Give hw some time and ACK command just in
 	 * case restart did not happen. */
 	mdelay(5);
+#ifndef PRISM2_USB
 	HFA384X_OUTW(HFA384X_EV_CMD, HFA384X_EVACK_OFF);
+#endif
 
 	if (prism2_enable_aux_port(dev, 0)) {
 		printk(KERN_DEBUG "%s: Disabling AUX port failed\n",
@@ -334,6 +361,7 @@ static int prism2_download_volatile(local_info_t *local,
 }
 
 
+#ifndef PRISM2_USB
 static int prism2_enable_genesis(local_info_t *local, int hcr)
 {
 	struct net_device *dev = local->dev;
@@ -651,6 +679,7 @@ static int prism2_download_nonvolatile(local_info_t *local,
 	return ret;
 }
 #endif /* PRISM2_NON_VOLATILE_DOWNLOAD */
+#endif
 
 
 static void prism2_download_free_data(struct prism2_download_data *dl)

@@ -139,7 +139,9 @@ static int prism2_download_volatile(local_info_t *local,
 				    struct prism2_download_data *param);
 static int prism2_download_genesis(local_info_t *local,
 				   struct prism2_download_data *param);
+#ifndef PRISM2_USB
 static int prism2_get_ram_size(local_info_t *local);
+#endif
 #endif /* PRISM2_DOWNLOAD_SUPPORT */
 
 

@@ -184,6 +184,12 @@ struct hfa384x_wrid_req {
 /*	u8 data[xxx]; */
 } __packed;
 
+struct hfa384x_rmem_req {
+	__le16 type;
+	__le16 frmlen;
+	__le16 offset;
+	__le16 page;
+} __packed;
 
 static void hfa384x_usbout_callback(struct urb *urb);
 
@@ -515,6 +521,64 @@ static int hfa384x_cmd_issue(struct net_device *dev,
 
 	return ret;
 }
+
+static int hfa384x_cmd_simple(struct net_device *dev, u16 cmdc, u16 param0,
+		u16 param1, u16 param2/*, u16 *resp0*/)
+{
+	struct hostap_interface *iface;
+	local_info_t *local;
+	struct sk_buff *skb;
+	struct hfa384x_cmd_req cmd;
+	struct hostap_usb_priv *hw_priv;
+	int res = 0;
+
+	printk(KERN_DEBUG "%s cmds %d\n", dev_info, cmdc);
+
+	iface = netdev_priv(dev);
+	local = iface->local;
+	hw_priv =  local->hw_priv;
+
+	if (local->func->card_present && !local->func->card_present(local))
+		return -ENODEV;
+
+	skb = ALLOC_TX_SKB(sizeof(cmd));
+	if (!skb)
+		return -ENOMEM;
+
+	memset(&cmd, 0, sizeof(cmd));
+	cmd.type = cpu_to_le16(HFA384x_USB_TYPE_CMD);
+	cmd.cmd = cmdc;
+	cmd.param0 = param0;
+	cmd.param1 = param1;
+	cmd.param2 = param2;
+	memcpy(skb_put(skb, sizeof(cmd)), &cmd, sizeof(cmd));
+
+	hfa384x_cb(skb)->calb = NULL;
+	hfa384x_cb(skb)->noresp = 0;
+	res = hfa384x_usbout(dev, skb);
+	if (res) {
+		dev_kfree_skb(skb);
+		return res;
+	}
+
+	res = hfa384x_wait(dev, skb);
+
+	if (hfa384x_cb(skb)->response)
+		dev_kfree_skb(hfa384x_cb(skb)->response);
+	dev_kfree_skb(skb);
+
+	if (res) {
+		if (res != -ENODATA)
+			printk(KERN_DEBUG "%s: hfa384x_cmd_simple(cmd=%04x, "
+			       "param0=%x) - failed - res=%d\n", dev->name, cmdc,
+			       param0, res);
+		if (res == -ETIMEDOUT)
+			prism2_hw_reset(dev);
+	}
+
+	return res;
+}
+
 static int prism2_tx_80211(struct sk_buff *skb, struct net_device *dev)
 {
 	return -1;
@@ -525,7 +589,7 @@ static int prism2_hw_init(struct net_device *dev, int initial)
 	struct hostap_interface *iface;
 	local_info_t *local;
 	struct hostap_usb_priv *hw_priv;
-	int ret;
+	int ret = 0;
 
 	PDEBUG(DEBUG_FLOW, "prism2_hw_init()\n");
 
@@ -533,8 +597,7 @@ static int prism2_hw_init(struct net_device *dev, int initial)
 	local = iface->local;
 	hw_priv = local->hw_priv;
 
-	if (!initial)
-		usb_kill_urb(&hw_priv->rx_urb);
+	if (initial != 2)
 	ret = hfa384x_submit_rx_urb(dev, GFP_KERNEL);
 	if (ret)
 		return 1;
@@ -549,8 +612,8 @@ static int prism2_hw_init(struct net_device *dev, int initial)
 		       dev_info);
 		local->no_pri = 1;
 #ifdef PRISM2_DOWNLOAD_SUPPORT
-		if (local->sram_type == -1)
-			local->sram_type = prism2_get_ram_size(local);
+//		if (local->sram_type == -1)
+//			local->sram_type = prism2_get_ram_size(local);
 #endif /* PRISM2_DOWNLOAD_SUPPORT */
 		return 1;
 	}
@@ -595,6 +658,157 @@ static void handle_reset_queue(struct work_struct *work)
 		netif_wake_queue(local->dev);
 	}
 }
+
+#ifdef PRISM2_DOWNLOAD_SUPPORT
+static int prism2_enable_aux_port(struct net_device *dev, int enable)
+{
+	/* always enabled */
+	return 0;
+}
+static int hfa384x_from_aux(struct net_device *dev, unsigned int addr, int len,
+			    void *buf)
+{
+	int res, rlen = 0;
+	struct sk_buff *skb, *respskb;
+	struct hfa384x_rmem_req memreq;
+
+	if (addr & 1 || len & 1)
+		return -1;
+
+	skb = ALLOC_TX_SKB(sizeof(memreq));
+	if (!skb)
+		return -ENOMEM;
+
+	memset(&memreq, 0, sizeof(memreq));
+	memreq.type = cpu_to_le16(HFA384x_USB_TYPE_RDMEM);
+	memreq.frmlen = cpu_to_le16(len);
+	memreq.page = addr >> 16;
+	memreq.offset = addr & 0xffff;
+
+	memcpy(skb_put(skb, sizeof(memreq)), &memreq, sizeof(memreq));
+
+	hfa384x_cb(skb)->calb = NULL;
+	hfa384x_cb(skb)->noresp = 0;
+	res = hfa384x_usbout(dev, skb);
+	if (res) {
+		dev_kfree_skb(skb);
+		return res;
+	}
+
+	res = hfa384x_wait(dev, skb);
+
+	respskb = hfa384x_cb(skb)->response;
+
+	if (!respskb) {
+		res = -EIO;
+	}
+
+	if (!res) {
+		skb_pull(respskb, 2);
+		rlen = le16_to_cpu(*(u16*)(respskb->data));
+		skb_pull(respskb, 2);
+	}
+	if (!res && (rlen < skb->len || rlen != len)) {
+		printk(KERN_DEBUG "%s: hfa384x_from_aux - len mismatch: "
+		       "addr=0x%08x, len=%d (expected %d)\n",
+		       dev->name, addr, rlen, len);
+		res = -ENODATA;
+	}
+	if (!res)
+		memcpy(buf, respskb->data, len);
+
+	if (respskb)
+		dev_kfree_skb(respskb);
+	dev_kfree_skb(skb);
+
+	if (res) {
+		if (res != -ENODATA)
+			printk(KERN_DEBUG "%s: hfa384x_from_aux(addr=%08x, "
+			       "len=%d) - failed - res=%d\n", dev->name, addr,
+			       len, res);
+		if (res == -ETIMEDOUT)
+			prism2_hw_reset(dev);
+		return res;
+	}
+
+	return 0;
+}
+
+static int hfa384x_to_aux(struct net_device *dev, unsigned int addr, int len,
+			  void *buf)
+{
+	struct hostap_interface *iface;
+	local_info_t *local;
+	int res;
+	struct sk_buff *skb;
+	struct hfa384x_rmem_req *memreq;
+	unsigned int caddr, left, seglen;
+
+	iface = netdev_priv(dev);
+	local = iface->local;
+
+	skb = ALLOC_TX_SKB(sizeof(*memreq) + 2048);
+	if (!skb)
+		return -ENOMEM;
+
+	memreq = (struct hfa384x_rmem_req *)skb_put(skb, sizeof(*memreq));
+	left = len;
+	caddr = addr;
+	do {
+		seglen = 2048 - (caddr & 2047);
+		if (seglen > left)
+			seglen = left;
+
+		memset(memreq, 0, sizeof(memreq));
+		memreq->type = cpu_to_le16(HFA384x_USB_TYPE_WRMEM);
+		memreq->frmlen = cpu_to_le16(seglen + 6);
+		memreq->page = caddr >> 16;
+		memreq->offset = caddr & 0xffff;
+		skb_trim(skb, sizeof(*memreq));
+		memcpy(skb_put(skb, seglen), buf + (caddr - addr), seglen);
+
+		if (seglen % 2)
+			*skb_put(skb, 1) = 0;
+
+		hfa384x_cb(skb)->calb = NULL;
+		hfa384x_cb(skb)->noresp = 0;
+		res = hfa384x_usbout(dev, skb);
+		if (res) {
+			dev_kfree_skb(skb);
+			return res;
+		}
+
+		res = hfa384x_wait(dev, skb);
+
+		if (hfa384x_cb(skb)->response)
+			dev_kfree_skb(hfa384x_cb(skb)->response);
+
+		if (res) {
+			if (res != -ENODATA)
+				printk(KERN_DEBUG "%s: hfa384x_to_aux (addr=%08x, "
+				       "len=%d) - failed - res=%d\n", dev->name, addr,
+				       len, res);
+			if (res == -ETIMEDOUT)
+				prism2_hw_reset(dev);
+		}
+
+		if (!res) {
+			left -= seglen;
+			caddr += seglen;
+		}
+	} while (!res && left > 0);
+
+	dev_kfree_skb(skb);
+
+	return res;
+}
+
+static int prism2_download_genesis(local_info_t *local,
+				   struct prism2_download_data *param)
+{return -1;}
+//static int prism2_get_ram_size(local_info_t *local);
+#endif /* PRISM2_DOWNLOAD_SUPPORT */
+
 
 /* FIX: This might change at some point.. */
 #include "hostap_hw.c"

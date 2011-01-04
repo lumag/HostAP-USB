@@ -12,11 +12,11 @@
 #define PRISM2_MAX_INTERRUPT_EVENTS 20
 
 /* Include code for downloading firmware images into volatile RAM. */
-//#define PRISM2_DOWNLOAD_SUPPORT
+#define PRISM2_DOWNLOAD_SUPPORT
 
 /* Allow kernel configuration to enable download support. */
 #if !defined(PRISM2_DOWNLOAD_SUPPORT) && defined(CONFIG_HOSTAP_FIRMWARE)
-//#define PRISM2_DOWNLOAD_SUPPORT
+#define PRISM2_DOWNLOAD_SUPPORT
 #endif
 
 /* Allow kernel configuration to enable non-volatile download support. */
