@@ -1009,6 +1009,7 @@ static void hfa384x_usbin_callback(struct urb *urb)
 	} else {
 		// FIXME: handle back tx completition
 		// FIXME: handle RX errors (len, see prism2_rx)
+		skb->dev = dev;
 		skb_queue_tail(&local->rx_list, skb);
 		tasklet_schedule(&local->rx_tasklet);
 	}
